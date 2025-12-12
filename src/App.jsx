@@ -26,13 +26,17 @@ const getPenAvailability = (penSize, mgUsed) => {
   const clickCap = getClickCapacity(penSize)
   const totalCap = getTotalCapacity(penSize)
   
-  const fromClicks = Math.max(0, clickCap - mgUsed)
-  const fromSyringe = Math.max(0, totalCap - Math.max(mgUsed, clickCap))
+  // Round to 1 decimal place to avoid floating point precision issues
+  const round1 = (n) => Math.round(n * 10) / 10
+  
+  const fromClicks = round1(Math.max(0, clickCap - mgUsed))
+  const fromSyringe = round1(Math.max(0, totalCap - Math.max(mgUsed, clickCap)))
+  const total = round1(fromClicks + fromSyringe)
   
   return {
     fromClicks,
     fromSyringe,
-    total: fromClicks + fromSyringe,
+    total,
     clicksRemaining: Math.round(fromClicks * (60 / penSize))
   }
 }
@@ -46,8 +50,11 @@ const getDoseBreakdown = (penSize, mgUsedBefore, doseMg) => {
   const clickCap = getClickCapacity(penSize)
   const clicksAvailable = Math.max(0, clickCap - mgUsedBefore)
   
-  const fromClicks = Math.min(doseMg, clicksAvailable)
-  const fromSyringe = doseMg - fromClicks
+  // Round to 1 decimal place to avoid floating point precision issues
+  const round1 = (n) => Math.round(n * 10) / 10
+  
+  const fromClicks = round1(Math.min(doseMg, clicksAvailable))
+  const fromSyringe = round1(doseMg - fromClicks)
   
   return {
     fromClicks,
@@ -175,7 +182,7 @@ const LoginPage = () => {
           <div className="w-16 h-16 bg-gradient-to-br from-teal-500 to-teal-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
             <Droplets size={32} className="text-white" />
           </div>
-          <h1 className="text-2xl font-bold text-slate-800">Mounjaro Tracker</h1>
+          <h1 className="text-2xl font-bold text-slate-800">Mounjaro Hub</h1>
           <p className="text-slate-500 mt-2">Track your Tirzepatide doses and inventory</p>
         </div>
 
@@ -759,7 +766,8 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
     const pen = pens.find(p => p.id === newDose.penId)
     if (!pen) return
     
-    const doseMg = parseFloat(newDose.mg)
+    // Round to 1 decimal place to avoid floating point issues
+    const doseMg = Math.round(parseFloat(newDose.mg) * 10) / 10
     if (!canAffordDose(doseMg, pen)) return
     
     setLoading(true)
@@ -1669,7 +1677,7 @@ export default function App() {
                 <Droplets size={22} className="text-white" />
               </div>
               <div>
-                <h1 className="text-xl font-bold text-slate-800">Mounjaro Tracker</h1>
+                <h1 className="text-xl font-bold text-slate-800">Mounjaro Hub</h1>
                 <p className="text-sm text-slate-500">Tirzepatide dose management</p>
               </div>
             </div>
