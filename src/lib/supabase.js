@@ -144,6 +144,16 @@ export async function deleteDosesByPenId(penId) {
     .from('doses')
     .delete()
     .eq('pen_id', penId)
-  
+
+  if (error) throw error
+}
+
+export async function deleteAllPlannedDoses(userId) {
+  const { error } = await supabase
+    .from('doses')
+    .delete()
+    .eq('user_id', userId)
+    .eq('is_completed', false)
+
   if (error) throw error
 }
