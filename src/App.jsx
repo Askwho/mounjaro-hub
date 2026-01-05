@@ -6,9 +6,9 @@ import {
 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Area, ComposedChart } from 'recharts'
 import { useAuth } from './contexts/AuthContext'
-import { 
+import {
   fetchPens, createPen, deletePen,
-  fetchDoses, createDose, updateDose, deleteDose, deleteDosesByPenId
+  fetchDoses, createDose, updateDose, deleteDose, deleteDosesByPenId, deleteAllPlannedDoses
 } from './lib/supabase'
 
 // ============================================================================
@@ -624,12 +624,15 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
   const [showDoseModal, setShowDoseModal] = useState(false)
   const [editingDose, setEditingDose] = useState(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [showClearAllConfirm, setShowClearAllConfirm] = useState(false)
   const [loading, setLoading] = useState(false)
   const [newDose, setNewDose] = useState({
     penId: '',
     mg: '',
     isCustom: false,
-    isCompleted: false
+    isCompleted: false,
+    repeatEnabled: false,
+    repeatDays: 7
   })
 
   const activePens = useMemo(() => {
@@ -732,7 +735,9 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
       penId: defaultPen?.id || '',
       mg: defaultMg,
       isCustom: isCustom,
-      isCompleted: date <= new Date()
+      isCompleted: date <= new Date(),
+      repeatEnabled: false,
+      repeatDays: 7
     })
     setShowDoseModal(true)
   }
@@ -749,7 +754,9 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
       penId: dose.penId,
       mg: dose.mg,
       isCustom: !PEN_SIZES.includes(dose.mg),
-      isCompleted: dose.isCompleted
+      isCompleted: dose.isCompleted,
+      repeatEnabled: false,
+      repeatDays: 7
     })
     setShowDoseModal(true)
   }
@@ -762,14 +769,14 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
 
   const handleSaveDose = async () => {
     if (!selectedDate || !newDose.penId || !newDose.mg) return
-    
+
     const pen = pens.find(p => p.id === newDose.penId)
     if (!pen) return
-    
+
     // Round to 1 decimal place to avoid floating point issues
     const doseMg = Math.round(parseFloat(newDose.mg) * 10) / 10
     if (!canAffordDose(doseMg, pen)) return
-    
+
     setLoading(true)
     try {
       if (editingDose) {
@@ -780,6 +787,38 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
           isCompleted: newDose.isCompleted
         })
         setDoses(prev => prev.map(d => d.id === editingDose.id ? updated : d))
+      } else if (newDose.repeatEnabled) {
+        // Repeat dosing: create multiple doses until pen is exhausted
+        const createdDoses = []
+        let currentDate = new Date(selectedDate)
+        let currentUsage = penUsage[pen.id] || 0
+
+        // Calculate how many doses we can fit
+        while (true) {
+          const availability = getPenAvailability(pen.size, currentUsage)
+
+          // Check if we can afford another dose
+          if (Math.round(doseMg * 10) > Math.round(availability.total * 10)) {
+            break
+          }
+
+          // Create the dose
+          const dose = await createDose(userId, {
+            penId: newDose.penId,
+            date: currentDate.toISOString(),
+            mg: doseMg,
+            isCompleted: false
+          })
+
+          createdDoses.push(dose)
+          currentUsage += doseMg
+
+          // Move to next date
+          currentDate = new Date(currentDate)
+          currentDate.setDate(currentDate.getDate() + newDose.repeatDays)
+        }
+
+        setDoses(prev => [...prev, ...createdDoses])
       } else {
         const dose = await createDose(userId, {
           penId: newDose.penId,
@@ -799,7 +838,7 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
 
   const handleDeleteDose = async () => {
     if (!editingDose) return
-    
+
     setLoading(true)
     try {
       await deleteDose(editingDose.id)
@@ -811,6 +850,23 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
       setLoading(false)
     }
   }
+
+  const handleClearAllPlanned = async () => {
+    setLoading(true)
+    try {
+      await deleteAllPlannedDoses(userId)
+      setDoses(prev => prev.filter(d => d.isCompleted))
+      setShowClearAllConfirm(false)
+    } catch (err) {
+      console.error('Error clearing planned doses:', err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const plannedDosesCount = useMemo(() => {
+    return doses.filter(d => !d.isCompleted).length
+  }, [doses])
 
   const selectedPen = pens.find(p => p.id === newDose.penId)
   const availability = getPenAvailabilityForEdit(selectedPen)
@@ -852,7 +908,18 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold text-slate-800">Dose Calendar</h2>
+        <div className="flex items-center gap-3">
+          <h2 className="text-xl font-semibold text-slate-800">Dose Calendar</h2>
+          {plannedDosesCount > 0 && (
+            <button
+              onClick={() => setShowClearAllConfirm(true)}
+              className="px-3 py-1.5 text-sm border border-rose-200 text-rose-600 rounded-lg hover:bg-rose-50 transition-colors flex items-center gap-1.5"
+            >
+              <Trash2 size={14} />
+              Clear All Future ({plannedDosesCount})
+            </button>
+          )}
+        </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setCurrentMonth(new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1))}
@@ -1153,13 +1220,49 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
                   )}
                 </div>
               )}
-              
+
+              {!editingDose && !newDose.isCompleted && (
+                <div className="border-t border-slate-200 pt-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="repeatEnabled"
+                      checked={newDose.repeatEnabled}
+                      onChange={e => setNewDose(d => ({ ...d, repeatEnabled: e.target.checked }))}
+                      className="w-4 h-4 text-teal-600 rounded focus:ring-teal-500"
+                    />
+                    <label htmlFor="repeatEnabled" className="text-sm font-medium text-slate-700">
+                      Repeat every X days until pen is exhausted
+                    </label>
+                  </div>
+
+                  {newDose.repeatEnabled && (
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-2">
+                        Repeat every (days)
+                      </label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="30"
+                        value={newDose.repeatDays}
+                        onChange={e => setNewDose(d => ({ ...d, repeatDays: parseInt(e.target.value) || 7 }))}
+                        className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                      <p className="text-xs text-slate-500 mt-1">
+                        Doses will be scheduled every {newDose.repeatDays} day{newDose.repeatDays !== 1 ? 's' : ''} until the pen runs out
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="flex items-center gap-2">
                 <input
                   type="checkbox"
                   id="isCompleted"
                   checked={newDose.isCompleted}
-                  onChange={e => setNewDose(d => ({ ...d, isCompleted: e.target.checked }))}
+                  onChange={e => setNewDose(d => ({ ...d, isCompleted: e.target.checked, repeatEnabled: e.target.checked ? false : d.repeatEnabled }))}
                   className="w-4 h-4 text-teal-600 rounded focus:ring-teal-500"
                 />
                 <label htmlFor="isCompleted" className="text-sm text-slate-700">
@@ -1188,6 +1291,36 @@ const DoseCalendar = ({ pens, doses, setDoses, penUsage, userId }) => {
               </div>
             </>
           )}
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={showClearAllConfirm}
+        onClose={() => setShowClearAllConfirm(false)}
+        title="Clear All Future Doses"
+      >
+        <div className="space-y-4">
+          <div className="bg-rose-50 border border-rose-200 rounded-lg p-4 text-center">
+            <Trash2 size={24} className="mx-auto mb-2 text-rose-500" />
+            <p className="font-medium text-rose-800">Delete all {plannedDosesCount} planned dose{plannedDosesCount !== 1 ? 's' : ''}?</p>
+            <p className="text-sm text-rose-600 mt-1">This action cannot be undone. Completed doses will not be affected.</p>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowClearAllConfirm(false)}
+              disabled={loading}
+              className="flex-1 py-2.5 border border-slate-200 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors font-medium disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleClearAllPlanned}
+              disabled={loading}
+              className="flex-1 py-2.5 bg-rose-600 text-white rounded-lg hover:bg-rose-700 transition-colors font-medium disabled:opacity-50"
+            >
+              {loading ? 'Clearing...' : 'Yes, Clear All'}
+            </button>
+          </div>
         </div>
       </Modal>
     </div>
