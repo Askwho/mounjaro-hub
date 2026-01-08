@@ -97,25 +97,108 @@ const getDaysBetween = (date1, date2) => {
 const calculateConcentration = (doses, targetDate) => {
   const target = new Date(targetDate)
   target.setHours(12, 0, 0, 0)
-  
+
   let concentration = 0
-  
+
   const completedDoses = doses
     .filter(d => d.isCompleted && new Date(d.date) <= target)
     .sort((a, b) => new Date(a.date) - new Date(b.date))
-  
+
   for (const dose of completedDoses) {
     const doseDate = new Date(dose.date)
     doseDate.setHours(12, 0, 0, 0)
     const daysSinceDose = (target - doseDate) / (1000 * 60 * 60 * 24)
-    
+
     if (daysSinceDose >= 0) {
       const remaining = dose.mg * Math.pow(0.5, daysSinceDose / HALF_LIFE_DAYS)
       concentration += remaining
     }
   }
-  
+
   return concentration
+}
+
+const calculateUsageRate = (doses, penId) => {
+  // Get completed doses for this pen
+  const penDoses = doses
+    .filter(d => d.penId === penId && d.isCompleted)
+    .sort((a, b) => new Date(a.date) - new Date(b.date))
+
+  if (penDoses.length < 2) return null
+
+  const firstDose = penDoses[0]
+  const lastDose = penDoses[penDoses.length - 1]
+  const daysBetween = getDaysBetween(firstDose.date, lastDose.date)
+
+  if (daysBetween === 0) return null
+
+  const totalMg = penDoses.reduce((sum, d) => sum + d.mg, 0)
+  return totalMg / daysBetween
+}
+
+const calculateExpirationRisk = (pen, doses, penUsage) => {
+  const now = new Date()
+  now.setHours(0, 0, 0, 0)
+  const expDate = new Date(pen.expirationDate)
+  expDate.setHours(0, 0, 0, 0)
+
+  const daysUntilExpiration = Math.ceil((expDate - now) / (1000 * 60 * 60 * 24))
+
+  // Already expired
+  if (daysUntilExpiration < 0) {
+    return { status: 'expired', daysUntilExpiration, daysUntilEmpty: null, riskLevel: 'high' }
+  }
+
+  const usage = penUsage[pen.id] || 0
+  const availability = getPenAvailability(pen.size, usage)
+
+  // Pen is already empty
+  if (availability.total === 0) {
+    return { status: 'empty', daysUntilExpiration, daysUntilEmpty: 0, riskLevel: 'none' }
+  }
+
+  // Calculate usage rate
+  const usageRate = calculateUsageRate(doses, pen.id)
+
+  // Not enough history to predict
+  if (!usageRate || usageRate === 0) {
+    // Just warn if expiring soon
+    if (daysUntilExpiration <= 30) {
+      return {
+        status: 'expiring-soon',
+        daysUntilExpiration,
+        daysUntilEmpty: null,
+        riskLevel: daysUntilExpiration <= 7 ? 'high' : 'medium',
+        message: 'Not enough usage history to predict'
+      }
+    }
+    return { status: 'ok', daysUntilExpiration, daysUntilEmpty: null, riskLevel: 'none' }
+  }
+
+  // Estimate days until pen is empty
+  const daysUntilEmpty = Math.ceil(availability.total / usageRate)
+
+  // Pen will expire before being used up
+  if (daysUntilEmpty > daysUntilExpiration) {
+    const mgAtExpiration = availability.total - (usageRate * daysUntilExpiration)
+    return {
+      status: 'at-risk',
+      daysUntilExpiration,
+      daysUntilEmpty,
+      riskLevel: mgAtExpiration > pen.size ? 'high' : 'medium',
+      mgAtRisk: Math.max(0, mgAtExpiration),
+      usageRate
+    }
+  }
+
+  // Pen will be used before expiration
+  return {
+    status: 'ok',
+    daysUntilExpiration,
+    daysUntilEmpty,
+    riskLevel: 'none',
+    usageRate
+  }
 }
 
 // ============================================================================
@@ -249,8 +332,50 @@ const Dashboard = ({ pens, doses, penUsage }) => {
     .sort((a, b) => new Date(a.date) - new Date(b.date))
     .slice(0, 5)
 
+  const atRiskPens = pens
+    .map(pen => ({ pen, risk: calculateExpirationRisk(pen, doses, penUsage) }))
+    .filter(({ risk }) => risk.status === 'at-risk')
+    .sort((a, b) => b.risk.mgAtRisk - a.risk.mgAtRisk)
+
   return (
     <div className="space-y-6">
+      {atRiskPens.length > 0 && (
+        <div className="bg-orange-50 border border-orange-200 rounded-xl p-4">
+          <div className="flex items-start gap-3">
+            <div className="p-2 bg-orange-100 rounded-lg">
+              <AlertTriangle size={20} className="text-orange-600" />
+            </div>
+            <div className="flex-1">
+              <h3 className="font-semibold text-orange-900 mb-2">
+                {atRiskPens.length} pen{atRiskPens.length !== 1 ? 's' : ''} may expire before fully used
+              </h3>
+              <div className="space-y-2">
+                {atRiskPens.map(({ pen, risk }) => {
+                  const usage = penUsage[pen.id] || 0
+                  const availability = getPenAvailability(pen.size, usage)
+                  return (
+                    <div key={pen.id} className="bg-white rounded-lg p-3 text-sm">
+                      <div className="flex items-start justify-between mb-1">
+                        <div className="font-medium text-slate-800">{pen.size}mg pen</div>
+                        <div className="text-xs text-orange-600">
+                          Expires in {risk.daysUntilExpiration} days
+                        </div>
+                      </div>
+                      <div className="text-slate-600">
+                        {availability.total.toFixed(1)}mg remaining • Using {risk.usageRate.toFixed(1)}mg/day
+                      </div>
+                      <div className="text-orange-700 mt-1">
+                        ⚠️ ~{risk.mgAtRisk.toFixed(1)}mg may be wasted if usage continues at current rate
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white rounded-xl border border-slate-200 p-4">
           <div className="text-sm text-slate-500 mb-1">Days Since Dose</div>
@@ -466,13 +591,15 @@ const PenInventory = ({ pens, setPens, doses, setDoses, penUsage, userId }) => {
             const isExpiringSoon = !isExpired && getDaysUntil(pen.expirationDate) <= 14
             const isEmpty = availability.total === 0
             const penDoseCount = getDosesForPen(pen.id).length
-            
+            const expirationRisk = calculateExpirationRisk(pen, doses, penUsage)
+
             return (
-              <div 
+              <div
                 key={pen.id}
                 className={`rounded-xl border p-4 ${
                   isExpired ? 'bg-rose-50 border-rose-200' :
                   isEmpty ? 'bg-slate-50 border-slate-200 opacity-60' :
+                  expirationRisk.status === 'at-risk' ? 'bg-orange-50 border-orange-200' :
                   isExpiringSoon ? 'bg-amber-50 border-amber-200' :
                   'bg-white border-slate-200'
                 }`}
@@ -489,16 +616,18 @@ const PenInventory = ({ pens, setPens, doses, setDoses, penUsage, userId }) => {
                     <Trash2 size={16} />
                   </button>
                 </div>
-                
+
                 <div className="space-y-2 mb-3">
                   <div className="flex justify-between text-sm">
                     <span className="text-slate-500">Remaining</span>
                     <span className="font-medium text-slate-700">{availability.total.toFixed(1)} mg</span>
                   </div>
                   <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
-                    <div 
+                    <div
                       className={`h-full rounded-full transition-all ${
-                        isExpired ? 'bg-rose-400' : isExpiringSoon ? 'bg-amber-400' : 'bg-teal-500'
+                        isExpired ? 'bg-rose-400' :
+                        expirationRisk.status === 'at-risk' ? 'bg-orange-400' :
+                        isExpiringSoon ? 'bg-amber-400' : 'bg-teal-500'
                       }`}
                       style={{ width: `${(availability.total / totalCap) * 100}%` }}
                     />
@@ -508,9 +637,11 @@ const PenInventory = ({ pens, setPens, doses, setDoses, penUsage, userId }) => {
                     <span>{availability.fromSyringe.toFixed(1)}mg syringe</span>
                   </div>
                 </div>
-                
+
                 <div className={`flex items-center gap-1.5 text-sm ${
-                  isExpired ? 'text-rose-600' : isExpiringSoon ? 'text-amber-600' : 'text-slate-500'
+                  isExpired ? 'text-rose-600' :
+                  expirationRisk.status === 'at-risk' ? 'text-orange-600' :
+                  isExpiringSoon ? 'text-amber-600' : 'text-slate-500'
                 }`}>
                   {isExpired ? <AlertTriangle size={14} /> : <Clock size={14} />}
                   <span>
@@ -518,7 +649,27 @@ const PenInventory = ({ pens, setPens, doses, setDoses, penUsage, userId }) => {
                     {!isExpired && ` (${getDaysUntil(pen.expirationDate)} days)`}
                   </span>
                 </div>
-                
+
+                {expirationRisk.status === 'at-risk' && !isExpired && (
+                  <div className="mt-2 p-2 bg-orange-100 border border-orange-200 rounded-lg text-xs text-orange-800">
+                    <div className="flex items-start gap-1.5">
+                      <AlertTriangle size={12} className="mt-0.5 flex-shrink-0" />
+                      <div>
+                        <div className="font-medium">May expire before fully used</div>
+                        <div className="text-orange-700 mt-0.5">
+                          ~{expirationRisk.mgAtRisk.toFixed(1)}mg may be wasted at current usage rate ({expirationRisk.usageRate.toFixed(1)}mg/day)
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {expirationRisk.status === 'ok' && expirationRisk.daysUntilEmpty && !isEmpty && !isExpired && (
+                  <div className="mt-2 text-xs text-slate-500">
+                    Est. {expirationRisk.daysUntilEmpty} days to empty ({expirationRisk.usageRate.toFixed(1)}mg/day)
+                  </div>
+                )}
+
                 {penDoseCount > 0 && (
                   <div className="mt-2 text-xs text-slate-400">
                     {penDoseCount} dose{penDoseCount !== 1 ? 's' : ''} logged
