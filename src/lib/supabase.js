@@ -157,3 +157,138 @@ export async function deleteAllPlannedDoses(userId) {
 
   if (error) throw error
 }
+
+// ============================================================================
+// METRICS SNAPSHOTS
+// ============================================================================
+
+export async function savePenMetricsSnapshot(userId, penMetric, snapshotDate) {
+  const { data, error } = await supabase
+    .from('pen_metrics_snapshots')
+    .upsert({
+      user_id: userId,
+      pen_id: penMetric.penId,
+      snapshot_date: snapshotDate,
+      pen_size: penMetric.penSize,
+      total_capacity: penMetric.totalCapacity,
+      mg_used: penMetric.usage,
+      mg_remaining: penMetric.remaining,
+      usage_efficiency: penMetric.usageEfficiency,
+      days_until_expiry: penMetric.daysUntilExpiry,
+      is_expired: penMetric.isExpired,
+      is_expiring_soon: penMetric.isExpiringSoon,
+      last_use_date: penMetric.lastUseDate ? penMetric.lastUseDate.toISOString().split('T')[0] : null,
+      days_between_last_use_and_expiry: penMetric.daysBetweenLastUseAndExpiry,
+      wasted_mg: penMetric.wastedMg,
+      waste_percentage: penMetric.wastePercentage,
+      risk_level: penMetric.riskLevel,
+      estimated_days_to_empty: penMetric.estimatedDaysToEmpty,
+      total_doses: penMetric.doseCount,
+      completed_doses: penMetric.completedDoseCount
+    }, {
+      onConflict: 'pen_id,snapshot_date'
+    })
+    .select()
+    .single()
+
+  if (error) throw error
+  return data
+}
+
+export async function saveSystemMetricsSnapshot(userId, systemMetrics, snapshotDate) {
+  const { data, error } = await supabase
+    .from('system_metrics_snapshots')
+    .upsert({
+      user_id: userId,
+      snapshot_date: snapshotDate,
+      total_pens: systemMetrics.totalPens,
+      active_pens: systemMetrics.activePens,
+      expired_pens: systemMetrics.expiredPens,
+      empty_pens: systemMetrics.emptyPens,
+      total_capacity: systemMetrics.totalCapacity,
+      total_used: systemMetrics.totalUsed,
+      total_remaining: systemMetrics.totalRemaining,
+      total_wasted: systemMetrics.totalWasted,
+      average_efficiency: systemMetrics.averageEfficiency,
+      average_waste_per_pen: systemMetrics.averageWastePerPen,
+      avg_days_between_last_use_and_expiry: systemMetrics.criticalMetrics.avgDaysBetweenLastUseAndExpiry,
+      pens_expired_with_medication: systemMetrics.criticalMetrics.pensExpiredWithMedication,
+      total_medication_wasted: systemMetrics.criticalMetrics.totalMedicationWasted,
+      pens_at_risk_count: systemMetrics.pensAtRisk.length
+    }, {
+      onConflict: 'user_id,snapshot_date'
+    })
+    .select()
+    .single()
+
+  if (error) throw error
+  return data
+}
+
+export async function fetchSystemMetricsSnapshots(userId, startDate, endDate) {
+  let query = supabase
+    .from('system_metrics_snapshots')
+    .select('*')
+    .eq('user_id', userId)
+    .order('snapshot_date', { ascending: true })
+
+  if (startDate) query = query.gte('snapshot_date', startDate)
+  if (endDate) query = query.lte('snapshot_date', endDate)
+
+  const { data, error } = await query
+  if (error) throw error
+
+  return data.map(snapshot => ({
+    date: snapshot.snapshot_date,
+    totalPens: snapshot.total_pens,
+    activePens: snapshot.active_pens,
+    expiredPens: snapshot.expired_pens,
+    emptyPens: snapshot.empty_pens,
+    totalCapacity: snapshot.total_capacity,
+    totalUsed: snapshot.total_used,
+    totalRemaining: snapshot.total_remaining,
+    totalWasted: snapshot.total_wasted,
+    averageEfficiency: snapshot.average_efficiency,
+    averageWastePerPen: snapshot.average_waste_per_pen,
+    avgDaysBetweenLastUseAndExpiry: snapshot.avg_days_between_last_use_and_expiry,
+    pensExpiredWithMedication: snapshot.pens_expired_with_medication,
+    totalMedicationWasted: snapshot.total_medication_wasted,
+    pensAtRiskCount: snapshot.pens_at_risk_count
+  }))
+}
+
+export async function fetchPenMetricsSnapshots(userId, penId, startDate, endDate) {
+  let query = supabase
+    .from('pen_metrics_snapshots')
+    .select('*')
+    .eq('user_id', userId)
+    .order('snapshot_date', { ascending: true })
+
+  if (penId) query = query.eq('pen_id', penId)
+  if (startDate) query = query.gte('snapshot_date', startDate)
+  if (endDate) query = query.lte('snapshot_date', endDate)
+
+  const { data, error } = await query
+  if (error) throw error
+
+  return data.map(snapshot => ({
+    date: snapshot.snapshot_date,
+    penId: snapshot.pen_id,
+    penSize: snapshot.pen_size,
+    totalCapacity: snapshot.total_capacity,
+    mgUsed: snapshot.mg_used,
+    mgRemaining: snapshot.mg_remaining,
+    usageEfficiency: snapshot.usage_efficiency,
+    daysUntilExpiry: snapshot.days_until_expiry,
+    isExpired: snapshot.is_expired,
+    isExpiringSoon: snapshot.is_expiring_soon,
+    lastUseDate: snapshot.last_use_date,
+    daysBetweenLastUseAndExpiry: snapshot.days_between_last_use_and_expiry,
+    wastedMg: snapshot.wasted_mg,
+    wastePercentage: snapshot.waste_percentage,
+    riskLevel: snapshot.risk_level,
+    estimatedDaysToEmpty: snapshot.estimated_days_to_empty,
+    totalDoses: snapshot.total_doses,
+    completedDoses: snapshot.completed_doses
+  }))
+}
