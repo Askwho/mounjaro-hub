@@ -173,14 +173,18 @@ const calculatePenMetrics = (pen, doses, penUsage) => {
 
   if (plannedDoses.length > 0) {
     // Simulate execution of planned doses
-    let cumulativeUsed = usage
+    // Start with only COMPLETED doses in cumulative usage
+    let cumulativeUsed = completedDoses.reduce((sum, d) => sum + d.mg, 0)
     let foundLastValidDose = false
 
     for (const dose of plannedDoses) {
       const doseDate = new Date(dose.date)
       doseDate.setHours(0, 0, 0, 0)
 
-      const wouldRemain = totalCapacity - (cumulativeUsed + dose.mg)
+      // Round to 1 decimal to avoid floating point issues
+      const round1 = (n) => Math.round(n * 10) / 10
+      const currentRemaining = round1(totalCapacity - cumulativeUsed)
+      const wouldRemain = round1(currentRemaining - dose.mg)
 
       // Check if dose is after expiry
       if (doseDate > expiryDate) {
@@ -192,15 +196,15 @@ const calculatePenMetrics = (pen, doses, penUsage) => {
         })
       }
 
-      // Check if we'll run out before this dose
-      if (wouldRemain < 0 && !willRunOutBeforePlannedComplete) {
+      // Check if we have LESS medication than this dose requires (not just ending at 0)
+      if (round1(dose.mg) > currentRemaining && !willRunOutBeforePlannedComplete) {
         willRunOutBeforePlannedComplete = true
       }
 
       // Track the last dose that's feasible (before expiry AND has enough med)
       if (doseDate <= expiryDate && wouldRemain >= 0) {
         projectedLastDoseDate = doseDate
-        cumulativeUsed += dose.mg
+        cumulativeUsed = round1(cumulativeUsed + dose.mg)
         foundLastValidDose = true
       }
     }
