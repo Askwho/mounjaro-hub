@@ -1,14 +1,16 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
-import { 
-  Calendar, Syringe, TrendingUp, History, Package, Plus, Trash2, 
+import {
+  Calendar, Syringe, TrendingUp, History, Package, Plus, Trash2,
   ChevronLeft, ChevronRight, AlertTriangle, Check, Clock, Droplets,
-  Activity, CalendarDays, X, Edit2, Save, LogOut, User
+  Activity, CalendarDays, X, Edit2, Save, LogOut, User, BarChart3,
+  Target, TrendingDown, Award
 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Area, ComposedChart } from 'recharts'
 import { useAuth } from './contexts/AuthContext'
 import {
   fetchPens, createPen, deletePen,
-  fetchDoses, createDose, updateDose, deleteDose, deleteDosesByPenId, deleteAllPlannedDoses
+  fetchDoses, createDose, updateDose, deleteDose, deleteDosesByPenId, deleteAllPlannedDoses,
+  savePenMetricsSnapshot, saveSystemMetricsSnapshot, fetchSystemMetricsSnapshots
 } from './lib/supabase'
 
 // ============================================================================
@@ -116,6 +118,172 @@ const calculateConcentration = (doses, targetDate) => {
   }
   
   return concentration
+}
+
+// ============================================================================
+// METRICS & TRACKING CALCULATIONS
+// ============================================================================
+
+const calculatePenMetrics = (pen, doses, penUsage) => {
+  const usage = penUsage[pen.id] || 0
+  const availability = getPenAvailability(pen.size, usage)
+  const totalCapacity = getTotalCapacity(pen.size)
+  const now = new Date()
+  now.setHours(0, 0, 0, 0)
+  const expiryDate = new Date(pen.expirationDate)
+  expiryDate.setHours(0, 0, 0, 0)
+
+  // Find doses for this pen
+  const penDoses = doses.filter(d => d.penId === pen.id)
+  const completedDoses = penDoses.filter(d => d.isCompleted).sort((a, b) => new Date(b.date) - new Date(a.date))
+  const lastDose = completedDoses[0]
+
+  // Calculate last use date
+  const lastUseDate = lastDose ? new Date(lastDose.date) : null
+  if (lastUseDate) lastUseDate.setHours(0, 0, 0, 0)
+
+  // Days until expiry
+  const daysUntilExpiry = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24))
+  const isExpired = daysUntilExpiry < 0
+  const isExpiringSoon = !isExpired && daysUntilExpiry <= 14
+
+  // Days between last use and expiry (CRITICAL METRIC)
+  const daysBetweenLastUseAndExpiry = lastUseDate
+    ? Math.ceil((expiryDate - lastUseDate) / (1000 * 60 * 60 * 24))
+    : null
+
+  // Usage efficiency
+  const usageEfficiency = (usage / totalCapacity) * 100
+
+  // Waste calculation
+  const wastedMg = isExpired ? availability.total : 0
+  const wastePercentage = isExpired ? (wastedMg / totalCapacity) * 100 : 0
+
+  // Risk assessment: Will the pen expire before being fully used?
+  const isEmpty = availability.total === 0
+  let riskLevel = 'none' // none, low, medium, high
+  let estimatedDaysToEmpty = null
+
+  if (!isExpired && !isEmpty && completedDoses.length >= 2) {
+    // Calculate average dose frequency
+    const sortedCompletedDoses = [...completedDoses].sort((a, b) => new Date(a.date) - new Date(b.date))
+    let totalGaps = 0
+    let gapCount = 0
+    for (let i = 1; i < sortedCompletedDoses.length; i++) {
+      const gap = getDaysBetween(sortedCompletedDoses[i-1].date, sortedCompletedDoses[i].date)
+      totalGaps += gap
+      gapCount++
+    }
+    const avgDaysBetweenDoses = totalGaps / gapCount
+
+    // Calculate average dose size
+    const avgDoseMg = completedDoses.reduce((sum, d) => sum + d.mg, 0) / completedDoses.length
+
+    // Estimate how many more doses we can get
+    const dosesRemaining = Math.floor(availability.total / avgDoseMg)
+    estimatedDaysToEmpty = dosesRemaining * avgDaysBetweenDoses
+
+    // Assess risk
+    if (estimatedDaysToEmpty > daysUntilExpiry) {
+      const daysOver = estimatedDaysToEmpty - daysUntilExpiry
+      if (daysOver > 14) {
+        riskLevel = 'high'
+      } else if (daysOver > 7) {
+        riskLevel = 'medium'
+      } else {
+        riskLevel = 'low'
+      }
+    }
+  }
+
+  return {
+    penId: pen.id,
+    penSize: pen.size,
+    totalCapacity,
+    usage,
+    remaining: availability.total,
+    usageEfficiency,
+    daysUntilExpiry,
+    isExpired,
+    isExpiringSoon,
+    isEmpty,
+    lastUseDate,
+    daysBetweenLastUseAndExpiry,
+    wastedMg,
+    wastePercentage,
+    riskLevel,
+    estimatedDaysToEmpty,
+    doseCount: penDoses.length,
+    completedDoseCount: completedDoses.length
+  }
+}
+
+const calculateSystemMetrics = (pens, doses, penUsage) => {
+  if (pens.length === 0) {
+    return {
+      totalPens: 0,
+      activePens: 0,
+      expiredPens: 0,
+      emptyPens: 0,
+      totalCapacity: 0,
+      totalUsed: 0,
+      totalRemaining: 0,
+      totalWasted: 0,
+      averageWastePerPen: 0,
+      averageEfficiency: 0,
+      pensAtRisk: [],
+      criticalMetrics: {
+        avgDaysBetweenLastUseAndExpiry: null,
+        pensExpiredWithMedication: 0,
+        totalMedicationWasted: 0
+      }
+    }
+  }
+
+  const penMetrics = pens.map(pen => calculatePenMetrics(pen, doses, penUsage))
+
+  const totalPens = pens.length
+  const activePens = penMetrics.filter(m => !m.isExpired && !m.isEmpty).length
+  const expiredPens = penMetrics.filter(m => m.isExpired).length
+  const emptyPens = penMetrics.filter(m => m.isEmpty).length
+
+  const totalCapacity = penMetrics.reduce((sum, m) => sum + m.totalCapacity, 0)
+  const totalUsed = penMetrics.reduce((sum, m) => sum + m.usage, 0)
+  const totalRemaining = penMetrics.reduce((sum, m) => sum + m.remaining, 0)
+  const totalWasted = penMetrics.reduce((sum, m) => sum + m.wastedMg, 0)
+
+  const averageWastePerPen = totalWasted / totalPens
+  const averageEfficiency = (totalUsed / totalCapacity) * 100
+
+  const pensAtRisk = penMetrics.filter(m => m.riskLevel !== 'none')
+
+  // Critical metrics
+  const pensWithLastUse = penMetrics.filter(m => m.daysBetweenLastUseAndExpiry !== null)
+  const avgDaysBetweenLastUseAndExpiry = pensWithLastUse.length > 0
+    ? pensWithLastUse.reduce((sum, m) => sum + m.daysBetweenLastUseAndExpiry, 0) / pensWithLastUse.length
+    : null
+
+  const pensExpiredWithMedication = penMetrics.filter(m => m.isExpired && m.wastedMg > 0).length
+
+  return {
+    totalPens,
+    activePens,
+    expiredPens,
+    emptyPens,
+    totalCapacity,
+    totalUsed,
+    totalRemaining,
+    totalWasted,
+    averageWastePerPen,
+    averageEfficiency,
+    pensAtRisk,
+    penMetrics,
+    criticalMetrics: {
+      avgDaysBetweenLastUseAndExpiry,
+      pensExpiredWithMedication,
+      totalMedicationWasted: totalWasted
+    }
+  }
 }
 
 // ============================================================================
@@ -1698,6 +1866,345 @@ const DoseHistory = ({ pens, doses, setDoses, penUsage, userId }) => {
 }
 
 // ============================================================================
+// METRICS OVERVIEW COMPONENT
+// ============================================================================
+
+const MetricsOverview = ({ pens, doses, penUsage, userId }) => {
+  const metrics = useMemo(() => calculateSystemMetrics(pens, doses, penUsage), [pens, doses, penUsage])
+  const [savingSnapshot, setSavingSnapshot] = useState(false)
+  const [snapshotSaved, setSnapshotSaved] = useState(false)
+
+  const handleSaveSnapshot = async () => {
+    setSavingSnapshot(true)
+    setSnapshotSaved(false)
+    try {
+      const today = new Date().toISOString().split('T')[0]
+
+      // Save system-wide metrics
+      await saveSystemMetricsSnapshot(userId, metrics, today)
+
+      // Save individual pen metrics
+      for (const penMetric of metrics.penMetrics) {
+        await savePenMetricsSnapshot(userId, penMetric, today)
+      }
+
+      setSnapshotSaved(true)
+      setTimeout(() => setSnapshotSaved(false), 3000)
+    } catch (err) {
+      console.error('Error saving metrics snapshot:', err)
+    } finally {
+      setSavingSnapshot(false)
+    }
+  }
+
+  if (pens.length === 0) {
+    return (
+      <div className="space-y-4">
+        <h2 className="text-xl font-semibold text-slate-800">Pen Metrics & Analytics</h2>
+        <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-slate-500">
+          <BarChart3 size={48} className="mx-auto mb-3 opacity-50" />
+          <p>No pens to analyze</p>
+          <p className="text-sm">Add pens to see detailed metrics</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-semibold text-slate-800">Pen Metrics & Analytics</h2>
+        <button
+          onClick={handleSaveSnapshot}
+          disabled={savingSnapshot}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+            snapshotSaved
+              ? 'bg-teal-100 text-teal-700 border border-teal-300'
+              : 'bg-teal-600 text-white hover:bg-teal-700 disabled:opacity-50'
+          }`}
+        >
+          {snapshotSaved ? (
+            <>
+              <Check size={18} />
+              Snapshot Saved
+            </>
+          ) : (
+            <>
+              <Calendar size={18} />
+              {savingSnapshot ? 'Saving...' : 'Save Daily Snapshot'}
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Critical Metrics - Days Between Last Use and Expiry */}
+      <div className="bg-gradient-to-br from-teal-500 to-teal-600 rounded-xl p-5 text-white">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="text-teal-100 text-sm mb-1">Critical Metric</div>
+            <div className="text-2xl font-bold">Last Use to Expiry Gap</div>
+          </div>
+          <Target size={32} className="text-teal-200" />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="bg-white/10 rounded-lg p-3">
+            <div className="text-teal-100 text-xs mb-1">Average Days Between</div>
+            <div className="text-2xl font-bold">
+              {metrics.criticalMetrics.avgDaysBetweenLastUseAndExpiry !== null
+                ? Math.round(metrics.criticalMetrics.avgDaysBetweenLastUseAndExpiry)
+                : '—'}
+            </div>
+            <div className="text-xs text-teal-100 mt-1">last use and expiry</div>
+          </div>
+
+          <div className="bg-white/10 rounded-lg p-3">
+            <div className="text-teal-100 text-xs mb-1">Pens Expired With Med</div>
+            <div className="text-2xl font-bold">
+              {metrics.criticalMetrics.pensExpiredWithMedication}
+            </div>
+            <div className="text-xs text-teal-100 mt-1">
+              {metrics.criticalMetrics.totalMedicationWasted > 0 &&
+                `${metrics.criticalMetrics.totalMedicationWasted.toFixed(1)}mg wasted`}
+            </div>
+          </div>
+
+          <div className="bg-white/10 rounded-lg p-3">
+            <div className="text-teal-100 text-xs mb-1">Pens At Risk</div>
+            <div className="text-2xl font-bold">{metrics.pensAtRisk.length}</div>
+            <div className="text-xs text-teal-100 mt-1">may expire before empty</div>
+          </div>
+        </div>
+      </div>
+
+      {/* System-Wide Stats */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="bg-white rounded-xl border border-slate-200 p-4">
+          <div className="text-sm text-slate-500 mb-1">Total Pens</div>
+          <div className="text-3xl font-bold text-slate-800">{metrics.totalPens}</div>
+          <div className="text-xs text-slate-400 mt-1">
+            {metrics.activePens} active, {metrics.expiredPens} expired
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-4">
+          <div className="text-sm text-slate-500 mb-1">Avg Efficiency</div>
+          <div className="text-3xl font-bold text-teal-600">
+            {metrics.averageEfficiency.toFixed(0)}<span className="text-lg">%</span>
+          </div>
+          <div className="text-xs text-slate-400 mt-1">medication utilized</div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-4">
+          <div className="text-sm text-slate-500 mb-1">Total Wasted</div>
+          <div className="text-3xl font-bold text-rose-600">
+            {metrics.totalWasted.toFixed(0)}<span className="text-lg">mg</span>
+          </div>
+          <div className="text-xs text-slate-400 mt-1">
+            {metrics.averageWastePerPen.toFixed(1)}mg per pen
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border border-slate-200 p-4">
+          <div className="text-sm text-slate-500 mb-1">Total Supply</div>
+          <div className="text-3xl font-bold text-slate-800">
+            {metrics.totalRemaining.toFixed(0)}<span className="text-lg">mg</span>
+          </div>
+          <div className="text-xs text-slate-400 mt-1">remaining now</div>
+        </div>
+      </div>
+
+      {/* Pens At Risk */}
+      {metrics.pensAtRisk.length > 0 && (
+        <div className="bg-white rounded-xl border border-amber-200 overflow-hidden">
+          <div className="bg-amber-50 px-4 py-3 border-b border-amber-200">
+            <div className="flex items-center gap-2">
+              <AlertTriangle size={20} className="text-amber-600" />
+              <h3 className="font-semibold text-amber-900">Pens At Risk of Expiry</h3>
+            </div>
+            <p className="text-sm text-amber-700 mt-1">
+              These pens may expire before being fully used at your current dosing rate
+            </p>
+          </div>
+          <div className="divide-y divide-slate-100">
+            {metrics.pensAtRisk.map(penMetric => {
+              const pen = pens.find(p => p.id === penMetric.penId)
+              return (
+                <div key={penMetric.penId} className="px-4 py-3 hover:bg-slate-50">
+                  <div className="flex items-start justify-between">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-slate-800">{penMetric.penSize}mg pen</span>
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                          penMetric.riskLevel === 'high' ? 'bg-rose-100 text-rose-700' :
+                          penMetric.riskLevel === 'medium' ? 'bg-amber-100 text-amber-700' :
+                          'bg-yellow-100 text-yellow-700'
+                        }`}>
+                          {penMetric.riskLevel.toUpperCase()} RISK
+                        </span>
+                      </div>
+                      <div className="text-sm text-slate-600 mt-1">
+                        {penMetric.remaining.toFixed(1)}mg remaining •
+                        Expires {formatDateShort(pen.expirationDate)} ({penMetric.daysUntilExpiry} days)
+                      </div>
+                      {penMetric.estimatedDaysToEmpty !== null && (
+                        <div className="text-sm text-amber-700 mt-1 flex items-center gap-1">
+                          <Clock size={14} />
+                          <span>
+                            Estimated {Math.ceil(penMetric.estimatedDaysToEmpty)} days to empty at current rate
+                            ({Math.ceil(penMetric.estimatedDaysToEmpty - penMetric.daysUntilExpiry)} days after expiry)
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Detailed Pen Metrics */}
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-200 bg-slate-50">
+          <h3 className="font-semibold text-slate-800">Detailed Pen Metrics</h3>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="bg-slate-50 border-b border-slate-200">
+              <tr>
+                <th className="px-4 py-2 text-left text-xs font-medium text-slate-500 uppercase">Pen</th>
+                <th className="px-4 py-2 text-left text-xs font-medium text-slate-500 uppercase">Status</th>
+                <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Efficiency</th>
+                <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Days to Expiry</th>
+                <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Last Use Gap</th>
+                <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Waste</th>
+                <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Doses</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {metrics.penMetrics.map(penMetric => {
+                const pen = pens.find(p => p.id === penMetric.penId)
+                return (
+                  <tr key={penMetric.penId} className="hover:bg-slate-50">
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-slate-800">{penMetric.penSize}mg</div>
+                      <div className="text-xs text-slate-500">
+                        {penMetric.remaining.toFixed(1)}/{penMetric.totalCapacity}mg
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1.5">
+                        {penMetric.isExpired ? (
+                          <>
+                            <div className="w-2 h-2 rounded-full bg-rose-500" />
+                            <span className="text-sm text-rose-700">Expired</span>
+                          </>
+                        ) : penMetric.isEmpty ? (
+                          <>
+                            <div className="w-2 h-2 rounded-full bg-slate-400" />
+                            <span className="text-sm text-slate-600">Empty</span>
+                          </>
+                        ) : penMetric.isExpiringSoon ? (
+                          <>
+                            <div className="w-2 h-2 rounded-full bg-amber-500" />
+                            <span className="text-sm text-amber-700">Expiring Soon</span>
+                          </>
+                        ) : (
+                          <>
+                            <div className="w-2 h-2 rounded-full bg-teal-500" />
+                            <span className="text-sm text-teal-700">Active</span>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className={`text-sm font-medium ${
+                        penMetric.usageEfficiency >= 90 ? 'text-teal-600' :
+                        penMetric.usageEfficiency >= 70 ? 'text-amber-600' :
+                        'text-slate-600'
+                      }`}>
+                        {penMetric.usageEfficiency.toFixed(0)}%
+                      </div>
+                      {penMetric.usageEfficiency >= 90 && (
+                        <Award size={12} className="inline text-teal-500 ml-1" />
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className={`text-sm ${
+                        penMetric.isExpired ? 'text-rose-600' :
+                        penMetric.daysUntilExpiry <= 7 ? 'text-amber-600' :
+                        'text-slate-700'
+                      }`}>
+                        {penMetric.isExpired ? 'Expired' : `${penMetric.daysUntilExpiry}d`}
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        {formatDateShort(pen.expirationDate)}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {penMetric.daysBetweenLastUseAndExpiry !== null ? (
+                        <div>
+                          <div className={`text-sm font-medium ${
+                            penMetric.daysBetweenLastUseAndExpiry <= 7 ? 'text-rose-600' :
+                            penMetric.daysBetweenLastUseAndExpiry <= 14 ? 'text-amber-600' :
+                            'text-teal-600'
+                          }`}>
+                            {penMetric.daysBetweenLastUseAndExpiry}d
+                          </div>
+                          <div className="text-xs text-slate-400">
+                            {formatDateShort(penMetric.lastUseDate)}
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="text-sm text-slate-400">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      {penMetric.wastedMg > 0 ? (
+                        <div>
+                          <div className="text-sm font-medium text-rose-600">
+                            {penMetric.wastedMg.toFixed(1)}mg
+                          </div>
+                          <div className="text-xs text-rose-500">
+                            {penMetric.wastePercentage.toFixed(0)}%
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="text-sm text-slate-400">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="text-sm text-slate-700">
+                        {penMetric.completedDoseCount}/{penMetric.doseCount}
+                      </div>
+                      <div className="text-xs text-slate-400">completed</div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Legend */}
+      <div className="bg-slate-50 rounded-lg p-4 text-sm text-slate-600">
+        <div className="font-medium text-slate-800 mb-2">Metric Definitions</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          <div><span className="font-medium">Efficiency:</span> Percentage of pen capacity that has been used</div>
+          <div><span className="font-medium">Days to Expiry:</span> Days remaining until expiration date</div>
+          <div><span className="font-medium">Last Use Gap:</span> Days between last completed dose and expiry date (critical metric)</div>
+          <div><span className="font-medium">Waste:</span> Medication remaining when pen expired</div>
+          <div><span className="font-medium">Risk Assessment:</span> Based on current dosing rate vs. days to expiry</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================================
 // MAIN APP COMPONENT
 // ============================================================================
 
@@ -1854,11 +2361,17 @@ export default function App() {
               icon={TrendingUp}
               label="PK Chart"
             />
-            <TabButton 
-              active={activeTab === 'history'} 
+            <TabButton
+              active={activeTab === 'history'}
               onClick={() => setActiveTab('history')}
               icon={History}
               label="History"
+            />
+            <TabButton
+              active={activeTab === 'metrics'}
+              onClick={() => setActiveTab('metrics')}
+              icon={BarChart3}
+              label="Metrics"
             />
           </nav>
         </div>
@@ -1879,6 +2392,9 @@ export default function App() {
         )}
         {activeTab === 'history' && (
           <DoseHistory pens={pens} doses={doses} setDoses={setDoses} penUsage={penUsage} userId={user.id} />
+        )}
+        {activeTab === 'metrics' && (
+          <MetricsOverview pens={pens} doses={doses} penUsage={penUsage} userId={user.id} />
         )}
       </main>
 
