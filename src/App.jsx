@@ -136,9 +136,10 @@ const calculatePenMetrics = (pen, doses, penUsage) => {
   // Find doses for this pen
   const penDoses = doses.filter(d => d.penId === pen.id)
   const completedDoses = penDoses.filter(d => d.isCompleted).sort((a, b) => new Date(b.date) - new Date(a.date))
+  const plannedDoses = penDoses.filter(d => !d.isCompleted).sort((a, b) => new Date(a.date) - new Date(b.date))
   const lastDose = completedDoses[0]
 
-  // Calculate last use date
+  // Calculate last use date (completed doses only)
   const lastUseDate = lastDose ? new Date(lastDose.date) : null
   if (lastUseDate) lastUseDate.setHours(0, 0, 0, 0)
 
@@ -159,13 +160,77 @@ const calculatePenMetrics = (pen, doses, penUsage) => {
   const wastedMg = isExpired ? availability.total : 0
   const wastePercentage = isExpired ? (wastedMg / totalCapacity) * 100 : 0
 
-  // Risk assessment: Will the pen expire before being fully used?
+  // ============================================================================
+  // FORWARD-LOOKING PLANNED DOSE ANALYSIS
+  // ============================================================================
+
+  let projectedLastDoseDate = null
+  let projectedDaysBetweenLastDoseAndExpiry = null
+  let plannedDosesAfterExpiry = []
+  let willRunOutBeforePlannedComplete = false
+  let projectedWasteMg = availability.total
+  let plannedRiskLevel = 'none'
+
+  if (plannedDoses.length > 0) {
+    // Simulate execution of planned doses
+    let cumulativeUsed = usage
+    let foundLastValidDose = false
+
+    for (const dose of plannedDoses) {
+      const doseDate = new Date(dose.date)
+      doseDate.setHours(0, 0, 0, 0)
+
+      const wouldRemain = totalCapacity - (cumulativeUsed + dose.mg)
+
+      // Check if dose is after expiry
+      if (doseDate > expiryDate) {
+        plannedDosesAfterExpiry.push({
+          id: dose.id,
+          date: dose.date,
+          mg: dose.mg,
+          daysAfterExpiry: Math.ceil((doseDate - expiryDate) / (1000 * 60 * 60 * 24))
+        })
+      }
+
+      // Check if we'll run out before this dose
+      if (wouldRemain < 0 && !willRunOutBeforePlannedComplete) {
+        willRunOutBeforePlannedComplete = true
+      }
+
+      // Track the last dose that's feasible (before expiry AND has enough med)
+      if (doseDate <= expiryDate && wouldRemain >= 0) {
+        projectedLastDoseDate = doseDate
+        cumulativeUsed += dose.mg
+        foundLastValidDose = true
+      }
+    }
+
+    // Calculate projected gap
+    if (projectedLastDoseDate) {
+      projectedDaysBetweenLastDoseAndExpiry = Math.ceil((expiryDate - projectedLastDoseDate) / (1000 * 60 * 60 * 24))
+      projectedWasteMg = Math.max(0, totalCapacity - cumulativeUsed)
+
+      // Assess risk based on projected gap
+      if (projectedDaysBetweenLastDoseAndExpiry > 30) {
+        plannedRiskLevel = 'low'
+      } else if (projectedDaysBetweenLastDoseAndExpiry > 14) {
+        plannedRiskLevel = 'medium'
+      } else if (projectedDaysBetweenLastDoseAndExpiry > 7) {
+        plannedRiskLevel = 'high'
+      } else {
+        plannedRiskLevel = 'critical'
+      }
+    } else if (!foundLastValidDose && plannedDoses.length > 0) {
+      plannedRiskLevel = 'critical'
+    }
+  }
+
+  // Historical risk assessment (for pens without planned doses)
   const isEmpty = availability.total === 0
-  let riskLevel = 'none' // none, low, medium, high
+  let historicalRiskLevel = 'none'
   let estimatedDaysToEmpty = null
 
-  if (!isExpired && !isEmpty && completedDoses.length >= 2) {
-    // Calculate average dose frequency
+  if (!isExpired && !isEmpty && completedDoses.length >= 2 && plannedDoses.length === 0) {
     const sortedCompletedDoses = [...completedDoses].sort((a, b) => new Date(a.date) - new Date(b.date))
     let totalGaps = 0
     let gapCount = 0
@@ -175,26 +240,24 @@ const calculatePenMetrics = (pen, doses, penUsage) => {
       gapCount++
     }
     const avgDaysBetweenDoses = totalGaps / gapCount
-
-    // Calculate average dose size
     const avgDoseMg = completedDoses.reduce((sum, d) => sum + d.mg, 0) / completedDoses.length
-
-    // Estimate how many more doses we can get
     const dosesRemaining = Math.floor(availability.total / avgDoseMg)
     estimatedDaysToEmpty = dosesRemaining * avgDaysBetweenDoses
 
-    // Assess risk
     if (estimatedDaysToEmpty > daysUntilExpiry) {
       const daysOver = estimatedDaysToEmpty - daysUntilExpiry
       if (daysOver > 14) {
-        riskLevel = 'high'
+        historicalRiskLevel = 'high'
       } else if (daysOver > 7) {
-        riskLevel = 'medium'
+        historicalRiskLevel = 'medium'
       } else {
-        riskLevel = 'low'
+        historicalRiskLevel = 'low'
       }
     }
   }
+
+  // Use planned risk if available, otherwise historical
+  const riskLevel = plannedDoses.length > 0 ? plannedRiskLevel : historicalRiskLevel
 
   return {
     penId: pen.id,
@@ -214,7 +277,15 @@ const calculatePenMetrics = (pen, doses, penUsage) => {
     riskLevel,
     estimatedDaysToEmpty,
     doseCount: penDoses.length,
-    completedDoseCount: completedDoses.length
+    completedDoseCount: completedDoses.length,
+    plannedDoseCount: plannedDoses.length,
+    // Forward-looking metrics
+    projectedLastDoseDate,
+    projectedDaysBetweenLastDoseAndExpiry,
+    plannedDosesAfterExpiry,
+    willRunOutBeforePlannedComplete,
+    projectedWasteMg,
+    hasPlannedDoses: plannedDoses.length > 0
   }
 }
 
@@ -2014,6 +2085,133 @@ const MetricsOverview = ({ pens, doses, penUsage, userId }) => {
         </div>
       </div>
 
+      {/* Planned Dose Issues - CRITICAL SECTION */}
+      {(() => {
+        const pensWithPlannedIssues = metrics.penMetrics.filter(m =>
+          m.hasPlannedDoses && (
+            m.plannedDosesAfterExpiry.length > 0 ||
+            m.willRunOutBeforePlannedComplete ||
+            (m.riskLevel === 'critical' || m.riskLevel === 'high')
+          )
+        )
+
+        if (pensWithPlannedIssues.length === 0) return null
+
+        return (
+          <div className="bg-white rounded-xl border border-rose-200 overflow-hidden">
+            <div className="bg-rose-50 px-4 py-3 border-b border-rose-200">
+              <div className="flex items-center gap-2">
+                <AlertTriangle size={20} className="text-rose-600" />
+                <h3 className="font-semibold text-rose-900">Planned Dose Issues</h3>
+              </div>
+              <p className="text-sm text-rose-700 mt-1">
+                These pens have problems with your scheduled doses
+              </p>
+            </div>
+            <div className="divide-y divide-slate-100">
+              {pensWithPlannedIssues.map(penMetric => {
+                const pen = pens.find(p => p.id === penMetric.penId)
+                return (
+                  <div key={penMetric.penId} className="px-4 py-4 hover:bg-slate-50">
+                    <div className="flex items-start justify-between mb-2">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-slate-800">{penMetric.penSize}mg pen</span>
+                          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                            penMetric.riskLevel === 'critical' ? 'bg-rose-100 text-rose-700' :
+                            penMetric.riskLevel === 'high' ? 'bg-amber-100 text-amber-700' :
+                            'bg-yellow-100 text-yellow-700'
+                          }`}>
+                            {penMetric.riskLevel === 'critical' ? 'CRITICAL' : penMetric.riskLevel.toUpperCase()} RISK
+                          </span>
+                          <span className="text-sm text-slate-600">
+                            {penMetric.plannedDoseCount} planned dose{penMetric.plannedDoseCount !== 1 ? 's' : ''}
+                          </span>
+                        </div>
+                        <div className="text-sm text-slate-600 mt-1">
+                          Expires {formatDateShort(pen.expirationDate)} ({penMetric.daysUntilExpiry} days)
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Issue warnings */}
+                    <div className="space-y-2 mt-3">
+                      {penMetric.plannedDosesAfterExpiry.length > 0 && (
+                        <div className="bg-rose-100 border border-rose-300 rounded-lg p-3">
+                          <div className="flex items-start gap-2">
+                            <AlertTriangle size={16} className="text-rose-700 mt-0.5 flex-shrink-0" />
+                            <div className="flex-1">
+                              <div className="font-medium text-rose-900">
+                                {penMetric.plannedDosesAfterExpiry.length} dose{penMetric.plannedDosesAfterExpiry.length !== 1 ? 's' : ''} scheduled after expiry
+                              </div>
+                              <div className="text-sm text-rose-700 mt-1">
+                                {penMetric.plannedDosesAfterExpiry.slice(0, 3).map((dose, idx) => (
+                                  <div key={idx}>
+                                    • {dose.mg}mg on {formatDateShort(dose.date)} ({dose.daysAfterExpiry} days after expiry)
+                                  </div>
+                                ))}
+                                {penMetric.plannedDosesAfterExpiry.length > 3 && (
+                                  <div className="text-rose-600 mt-1">
+                                    ...and {penMetric.plannedDosesAfterExpiry.length - 3} more
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {penMetric.willRunOutBeforePlannedComplete && (
+                        <div className="bg-amber-100 border border-amber-300 rounded-lg p-3">
+                          <div className="flex items-start gap-2">
+                            <AlertTriangle size={16} className="text-amber-700 mt-0.5 flex-shrink-0" />
+                            <div className="flex-1">
+                              <div className="font-medium text-amber-900">
+                                Insufficient medication for all planned doses
+                              </div>
+                              <div className="text-sm text-amber-700 mt-1">
+                                Only {penMetric.remaining.toFixed(1)}mg remaining, but planned doses require more
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {penMetric.projectedLastDoseDate && penMetric.projectedDaysBetweenLastDoseAndExpiry !== null && (
+                        <div className={`rounded-lg p-3 ${
+                          penMetric.projectedDaysBetweenLastDoseAndExpiry <= 7
+                            ? 'bg-rose-100 border border-rose-200'
+                            : 'bg-amber-100 border border-amber-200'
+                        }`}>
+                          <div className="flex items-start gap-2">
+                            <Clock size={16} className={`${
+                              penMetric.projectedDaysBetweenLastDoseAndExpiry <= 7 ? 'text-rose-700' : 'text-amber-700'
+                            } mt-0.5 flex-shrink-0`} />
+                            <div className="flex-1">
+                              <div className={`font-medium ${
+                                penMetric.projectedDaysBetweenLastDoseAndExpiry <= 7 ? 'text-rose-900' : 'text-amber-900'
+                              }`}>
+                                Projected last dose: {formatDateShort(penMetric.projectedLastDoseDate)}
+                              </div>
+                              <div className={`text-sm mt-1 ${
+                                penMetric.projectedDaysBetweenLastDoseAndExpiry <= 7 ? 'text-rose-700' : 'text-amber-700'
+                              }`}>
+                                Only {penMetric.projectedDaysBetweenLastDoseAndExpiry} days before expiry •
+                                Projected waste: {penMetric.projectedWasteMg.toFixed(1)}mg
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Pens At Risk */}
       {metrics.pensAtRisk.length > 0 && (
         <div className="bg-white rounded-xl border border-amber-200 overflow-hidden">
@@ -2079,6 +2277,7 @@ const MetricsOverview = ({ pens, doses, penUsage, userId }) => {
                 <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Efficiency</th>
                 <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Days to Expiry</th>
                 <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Last Use Gap</th>
+                <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Planned Projection</th>
                 <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Waste</th>
                 <th className="px-4 py-2 text-right text-xs font-medium text-slate-500 uppercase">Doses</th>
               </tr>
@@ -2162,6 +2361,38 @@ const MetricsOverview = ({ pens, doses, penUsage, userId }) => {
                       )}
                     </td>
                     <td className="px-4 py-3 text-right">
+                      {penMetric.hasPlannedDoses ? (
+                        <div>
+                          {penMetric.projectedLastDoseDate ? (
+                            <>
+                              <div className={`text-sm font-medium ${
+                                penMetric.projectedDaysBetweenLastDoseAndExpiry <= 7 ? 'text-rose-600' :
+                                penMetric.projectedDaysBetweenLastDoseAndExpiry <= 14 ? 'text-amber-600' :
+                                'text-teal-600'
+                              }`}>
+                                {penMetric.projectedDaysBetweenLastDoseAndExpiry}d gap
+                              </div>
+                              <div className="text-xs text-slate-400">
+                                {formatDateShort(penMetric.projectedLastDoseDate)}
+                              </div>
+                            </>
+                          ) : (
+                            <div className="text-sm font-medium text-rose-600">
+                              No valid doses
+                            </div>
+                          )}
+                          {(penMetric.plannedDosesAfterExpiry.length > 0 || penMetric.willRunOutBeforePlannedComplete) && (
+                            <div className="flex items-center justify-end gap-1 mt-1">
+                              <AlertTriangle size={12} className="text-rose-500" />
+                              <span className="text-xs text-rose-600">Issues</span>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-sm text-slate-400">No planned</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right">
                       {penMetric.wastedMg > 0 ? (
                         <div>
                           <div className="text-sm font-medium text-rose-600">
@@ -2195,9 +2426,10 @@ const MetricsOverview = ({ pens, doses, penUsage, userId }) => {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
           <div><span className="font-medium">Efficiency:</span> Percentage of pen capacity that has been used</div>
           <div><span className="font-medium">Days to Expiry:</span> Days remaining until expiration date</div>
-          <div><span className="font-medium">Last Use Gap:</span> Days between last completed dose and expiry date (critical metric)</div>
+          <div><span className="font-medium">Last Use Gap:</span> Days between last completed dose and expiry date</div>
+          <div><span className="font-medium">Planned Projection:</span> Projected gap between last planned dose and expiry (forward-looking)</div>
           <div><span className="font-medium">Waste:</span> Medication remaining when pen expired</div>
-          <div><span className="font-medium">Risk Assessment:</span> Based on current dosing rate vs. days to expiry</div>
+          <div><span className="font-medium">Risk Assessment:</span> Based on planned doses or historical patterns</div>
         </div>
       </div>
     </div>
