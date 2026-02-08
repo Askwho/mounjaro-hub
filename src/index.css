@@ -1,8 +1,34 @@
+@import '@fontsource-variable/plus-jakarta-sans';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* Custom scrollbar for better UX */
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Focus-visible ring for keyboard users only */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-teal-500;
+  }
+
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+}
+
+/* Skip to content link for screen readers */
+.skip-link {
+  @apply absolute -top-10 left-4 bg-teal-600 text-white px-4 py-2 rounded-b-lg z-[100] transition-all;
+}
+.skip-link:focus {
+  @apply top-0;
+}
+
+/* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

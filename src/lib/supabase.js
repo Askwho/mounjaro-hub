@@ -257,6 +257,78 @@ export async function fetchSystemMetricsSnapshots(userId, startDate, endDate) {
   }))
 }
 
+// ============================================================================
+// WEIGHT ENTRIES
+// ============================================================================
+
+export async function fetchWeights(userId) {
+  const { data, error } = await supabase
+    .from('weight_entries')
+    .select('*')
+    .eq('user_id', userId)
+    .order('date', { ascending: true })
+
+  if (error) throw error
+  return data.map(w => ({
+    id: w.id,
+    date: w.date,
+    weightKg: w.weight_kg,
+    notes: w.notes
+  }))
+}
+
+export async function createWeight(userId, entry) {
+  const { data, error } = await supabase
+    .from('weight_entries')
+    .insert({
+      user_id: userId,
+      date: entry.date,
+      weight_kg: entry.weightKg,
+      notes: entry.notes || ''
+    })
+    .select()
+    .single()
+
+  if (error) throw error
+  return {
+    id: data.id,
+    date: data.date,
+    weightKg: data.weight_kg,
+    notes: data.notes
+  }
+}
+
+export async function updateWeight(weightId, updates) {
+  const dbUpdates = {}
+  if (updates.date !== undefined) dbUpdates.date = updates.date
+  if (updates.weightKg !== undefined) dbUpdates.weight_kg = updates.weightKg
+  if (updates.notes !== undefined) dbUpdates.notes = updates.notes
+
+  const { data, error } = await supabase
+    .from('weight_entries')
+    .update(dbUpdates)
+    .eq('id', weightId)
+    .select()
+    .single()
+
+  if (error) throw error
+  return {
+    id: data.id,
+    date: data.date,
+    weightKg: data.weight_kg,
+    notes: data.notes
+  }
+}
+
+export async function deleteWeight(weightId) {
+  const { error } = await supabase
+    .from('weight_entries')
+    .delete()
+    .eq('id', weightId)
+
+  if (error) throw error
+}
+
 export async function fetchPenMetricsSnapshots(userId, penId, startDate, endDate) {
   let query = supabase
     .from('pen_metrics_snapshots')
